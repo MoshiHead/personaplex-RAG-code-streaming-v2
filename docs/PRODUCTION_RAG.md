@@ -106,3 +106,52 @@ resets mid-call. Larger knowledge bases or a larger embedding model will retriev
 larger `top_k` injects more tokens (~25ms/token, per the same benchmark). Once injection
 completes, streaming proceeds at the same speed as a connection with RAG disabled -- nothing in
 this mechanism touches the per-frame `opus_loop` cost.
+
+## 8. Real-pod bug: RAG never engaged for actual browser conversations (found and fixed)
+
+The first real-pod test of this feature was through the actual browser web UI (real microphone,
+real voice), not the notebook's scripted `rag.ws_demo_client` demo. The model gave generic,
+ungrounded answers -- the symptom looked like `text.txt` wasn't "properly processed", but the
+index and retrieval pipeline were both fine.
+
+**Root cause**: `moshi.server`'s `rag_query` connection parameter only exists because *this
+project* added it (Section 5's Mode C increment) -- the browser web UI predates it and has no
+field to send one. PersonaPlex has no ASR, so the browser UI has genuinely no text to put there
+even if it tried. `handle_chat`'s old code guarded injection on `rag_query` being truthy
+(`if self.rag_session is not None and rag_query:`), so for every real conversation through the
+browser, that condition was always false and RAG silently never engaged -- only the scripted demo
+(which explicitly sets `rag_query=AERO_QUESTION_TEXT`) ever exercised it. This had been latent
+since the Mode C increment; Section 22's own demo cell never caught it because it always supplies
+an explicit query.
+
+**Fix** (three changes, all in already-existing code paths, no new mechanism):
+
+1. `RAGSession._retrieve_for_injection` (`rag/server_integration.py`) now accepts a falsy `query`
+   and falls back to `Retriever.retrieve_all(limit=config.top_k)` -- injecting up to `top_k`
+   knowledge-base chunks regardless of relevance -- instead of skipping injection. New
+   `FaissVectorStore.get_all()`/`Retriever.retrieve_all()` (`rag/vector_store.py`,
+   `rag/retriever.py`) support this by reading back stored chunks directly, bypassing similarity
+   search entirely (there is nothing to rank against without a query).
+2. `moshi/moshi/server.py`'s `handle_chat` no longer requires `rag_query` to be truthy before
+   attempting injection. A new `RAGConfig.default_query` / `--rag-default-query` lets an operator
+   configure a real similarity-search fallback (e.g. a one-line description of the deployment's
+   domain) for connections that don't supply their own query; when that's also empty, the
+   whole-KB fallback above is what actually fires for a real browser connection.
+3. `moshi/moshi/offline.py`'s `--rag-enable` no longer hard-requires `--rag-query` for
+   `persona_rag`/`prompt_rag`/`cache_aware` (it still does for `turn_injection`/`dynamic_runtime`,
+   whose "prepare" methods retrieve directly, without this fallback).
+
+Section 22 of the notebook gained a verification cell ("Verify the fix: a connection with NO
+query") that connects with `rag_query=""` -- exactly what the browser sends -- and asserts
+injection still happened, instead of only ever testing the easy case.
+
+**The remaining, genuine limitation**: this fix makes the model *always have* the knowledge base
+in context, which is sufficient grounding for a knowledge base small enough to fit entirely within
+`top_k` chunks (true for the 10-paragraph `text.txt` sample regardless of phrasing). It is **not**
+true per-question retrieval -- there is still no live signal of what the user actually asked to
+rank chunks against. For a knowledge base too large for `top_k` to cover, the practical levers are
+a well-chosen `--rag-default-query` (static, but at least relevance-ranked) or, beyond the scope of
+this project as currently constrained, adding ASR -- and even then, Sections 8/10's real-pod
+findings suggest a turn-boundary-triggered mid-call injection would likely still arrive too late to
+influence the response. There is currently no way around this without changing the "no ASR, no
+mid-stream injection" constraints this project was built under.

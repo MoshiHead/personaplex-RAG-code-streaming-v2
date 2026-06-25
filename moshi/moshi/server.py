@@ -101,7 +101,8 @@ class ServerState:
                  rag_top_k: int = 5, rag_embedding_model: str = "bge-small",
                  rag_log_dir: str = "rag_logs", rag_injection_mode: str = "persona_rag",
                  rag_vad_enable: bool = False, rag_turn_injection_top_k: int = 2,
-                 rag_dynamic_injection_interval_s: float = 30.0, rag_dynamic_injection_top_k: int = 2):
+                 rag_dynamic_injection_interval_s: float = 30.0, rag_dynamic_injection_top_k: int = 2,
+                 rag_default_query: str = ""):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -167,6 +168,7 @@ class ServerState:
                 turn_injection_top_k=rag_turn_injection_top_k,
                 dynamic_injection_interval_s=rag_dynamic_injection_interval_s,
                 dynamic_injection_top_k=rag_dynamic_injection_top_k,
+                default_query=rag_default_query,
             )
             self.rag_session = RAGSession(
                 config=rag_config,
@@ -232,8 +234,17 @@ class ServerState:
         seed = int(request["seed"]) if "seed" in request.query else None
 
         # Optional per-connection RAG query (Mode C). `.get(...)` rather than `request.query[...]`
-        # so older/unmodified clients that never send this key are unaffected.
-        rag_query = request.query.get("rag_query", "")
+        # so older/unmodified clients that never send this key are unaffected. The browser web UI
+        # is exactly such a client -- it predates this parameter and has no way to send one, so
+        # `rag_query` is empty for every real voice connection through it. Falling back to
+        # `self.rag_session.config.default_query` (operator-configured via --rag-default-query) --
+        # and RAGSession itself falling back further still to injecting the whole knowledge base
+        # when even that's empty (see RAGSession._retrieve_for_injection) -- is what makes RAG
+        # actually engage for real conversations instead of only for callers that explicitly pass
+        # a query. See docs/PRODUCTION_RAG.md.
+        rag_query = request.query.get("rag_query", "") or (
+            self.rag_session.config.default_query if self.rag_session is not None else ""
+        )
 
         async def recv_loop():
             nonlocal close
@@ -393,7 +404,13 @@ class ServerState:
             # RingKVCache is preserved, not replaced. No-op (and zero added latency beyond a None
             # check) when RAG wasn't enabled at server startup. See
             # docs/STREAMING_AND_INJECTION_DESIGN.md Section 3/4.
-            if self.rag_session is not None and rag_query:
+            #
+            # Deliberately does NOT require `rag_query` to be truthy (it used to -- that was the
+            # bug: the browser web UI never sends one, so RAG silently never engaged for any real
+            # conversation through it). `rag_query` may be "" here; Mode C/B/F's retrieval methods
+            # already handle that by injecting the whole knowledge base instead of skipping (see
+            # RAGSession._retrieve_for_injection and docs/PRODUCTION_RAG.md).
+            if self.rag_session is not None:
                 from rag.config import InjectionMode
 
                 if self.rag_injection_mode is InjectionMode.PERSONA_RAG:
@@ -619,6 +636,14 @@ def main():
         help="Number of documents re-injected per fixed-interval burst in Mode E -- "
              "deliberately small; see RAGConfig.dynamic_injection_top_k."
     )
+    parser.add_argument(
+        "--rag-default-query", type=str, default="",
+        help="Fallback retrieval query used when a connection supplies no rag_query of its own -- "
+             "the normal case for the browser web UI, which has no way to send one. When this is "
+             "also empty (the default), RAGSession falls back further to injecting up to "
+             "--rag-top-k knowledge-base chunks regardless of relevance instead of skipping "
+             "injection entirely. See docs/PRODUCTION_RAG.md."
+    )
 
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
@@ -692,6 +717,7 @@ def main():
         rag_turn_injection_top_k=args.rag_turn_injection_top_k,
         rag_dynamic_injection_interval_s=args.rag_dynamic_injection_interval_s,
         rag_dynamic_injection_top_k=args.rag_dynamic_injection_top_k,
+        rag_default_query=args.rag_default_query,
     )
     logger.info("warming up the model")
     state.warmup()

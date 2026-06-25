@@ -86,7 +86,7 @@ class RAGSession:
         self._dynamic_injection_last_fire_time: Optional[float] = None
 
     # ---- Shared retrieval step for any connection-start mode (B or C) -----------------------
-    def _retrieve_for_injection(self, query: str, mode: str) -> tuple[RequestLogRecord, Optional[dict]]:
+    def _retrieve_for_injection(self, query: Optional[str], mode: str) -> tuple[RequestLogRecord, Optional[dict]]:
         """Runs retrieval and builds the common prefix of a log record for any connection-start
         injection mode. Returns `(record, None)` if the caller should stop immediately (RAG
         disabled, no index, or nothing retrieved above `score_threshold`) -- `record` already
@@ -97,23 +97,42 @@ class RAGSession:
         them is how the retrieved text gets formatted before injection. Sharing this step is what
         guarantees that property rather than relying on two copy-pasted implementations staying in
         sync by hand.
+
+        `query` may be falsy (`None`/`""`). This is the normal case for a real live connection
+        through the browser web UI: PersonaPlex has no ASR, and the web UI was never built to send
+        a `rag_query` parameter (it didn't exist when the UI was built) -- so a live connection
+        simply never has a query string to retrieve against. Skipping injection entirely in that
+        case would mean RAG never engages for any real conversation, only for callers that
+        explicitly pass a query (`moshi.offline --rag-query`, or `rag.ws_demo_client`'s scripted
+        demo). Instead, falsy `query` falls back to `Retriever.retrieve_all(limit=config.top_k)`
+        -- injecting up to `top_k` knowledge-base chunks (in insertion order, not
+        relevance-ranked, since there is no query to rank against) so the model has *something*
+        from the knowledge base in context regardless of what gets asked. See
+        docs/PRODUCTION_RAG.md for the full reasoning and its limits (this is a best-effort
+        default, not equivalent to true per-question retrieval).
         """
-        record = RequestLogRecord(mode=mode, user_query=query)
+        record = RequestLogRecord(mode=mode, user_query=query or None)
 
         if not self.config.enable_rag or self.retriever is None:
             record.injection_strategy = "skipped (RAG disabled or no index loaded)"
             return record, None
 
         t0 = time.monotonic()
-        retrieval = self.retriever.retrieve_context(
-            query, top_k=self.config.top_k, score_threshold=self.config.score_threshold
-        )
+        if query:
+            retrieval = self.retriever.retrieve_context(
+                query, top_k=self.config.top_k, score_threshold=self.config.score_threshold
+            )
+        else:
+            retrieval = self.retriever.retrieve_all(limit=self.config.top_k)
         record.retrieval_latency_s = time.monotonic() - t0
         record.retrieved_contexts = retrieval["contexts"]
         record.retrieved_scores = retrieval["scores"]
 
         if not retrieval["contexts"]:
-            record.injection_strategy = "skipped (no contexts above score_threshold)"
+            record.injection_strategy = (
+                "skipped (no contexts above score_threshold)" if query
+                else "skipped (no documents in the index)"
+            )
             return record, None
 
         return record, retrieval
@@ -137,7 +156,7 @@ class RAGSession:
         record.kv_cache_status = inspect_kv_cache(self._lm_gen)
 
     # ---- Mode C: connection-start / session-start injection --------------------------------
-    def inject_persona_compatible_knowledge(self, query: str) -> dict:
+    def inject_persona_compatible_knowledge(self, query: Optional[str]) -> dict:
         """Mode C. Retrieves context for `query`, folds it into the *same* `<system>...<system>`
         mechanism PersonaPlex's own persona prompt uses, and pushes it through the live model via
         one blocking `TokenInjector` burst.
@@ -150,6 +169,12 @@ class RAGSession:
         connection-start mechanism rather than a per-utterance one (PersonaPlex has no live
         speech-to-text of the user's audio to retrieve against mid-call -- see the Phase 2
         implementation report for this finding in full).
+
+        `query` may be falsy -- this is the normal case for a real connection through the browser
+        web UI, which has no way to supply one (see `_retrieve_for_injection`'s docstring). When
+        falsy, this injects up to `config.top_k` knowledge-base chunks regardless of relevance
+        (no query to rank against) instead of skipping injection entirely -- see
+        docs/PRODUCTION_RAG.md.
 
         Returns the record as a dict, **not yet written to the log**. The retrieval/injection
         phases are the only thing this method can time -- whatever happens next (the live
@@ -175,7 +200,7 @@ class RAGSession:
         return record.to_dict()
 
     # ---- Mode B: connection-start injection, naive prompt template (negative control) ------
-    def inject_standard_prompt_rag(self, query: str) -> dict:
+    def inject_standard_prompt_rag(self, query: Optional[str]) -> dict:
         """Mode B -- the deliberate negative-control baseline (see
         docs/ARCHITECTURE_REPORT.md Section 6). Retrieves context identically to Mode C (same
         `_retrieve_for_injection` call, same top_k/score_threshold), but formats it as a generic
@@ -207,7 +232,7 @@ class RAGSession:
         knowledge_block = "\n".join(retrieval["contexts"])
         naive_prompt = (
             f"Relevant Knowledge:\n{knowledge_block}\n\n"
-            f"User Question:\n{query}\n\n"
+            f"User Question:\n{query or '(not specified)'}\n\n"
             "Use the knowledge above when answering."
         )
         request = InjectionRequest(

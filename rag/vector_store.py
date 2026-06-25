@@ -104,6 +104,20 @@ class FaissVectorStore:
                 break
         return results
 
+    # ---- fetch everything, bypassing similarity search entirely -------------------------------
+    def get_all(self, limit: Optional[int] = None) -> list[SearchResult]:
+        """Returns every stored document (score fixed at 1.0, since no query/similarity search is
+        involved), in insertion order, optionally capped at `limit`. Used when there is no query
+        text to retrieve against at all -- see `Retriever.retrieve_all` -- not as a substitute for
+        real similarity search."""
+        ids = sorted(self._metadata.keys())
+        if limit is not None:
+            ids = ids[:limit]
+        return [
+            SearchResult(id=i, score=1.0, text=self._metadata[i].get("text", ""), metadata=self._metadata[i])
+            for i in ids
+        ]
+
     # ---- update / delete ---------------------------------------------------------------------
     def update(self, doc_id: int, vector: np.ndarray, text: str, metadata: Optional[dict] = None) -> None:
         """FAISS flat indexes have no in-place update; implemented as delete + re-add at the same id."""

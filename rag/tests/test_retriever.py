@@ -109,6 +109,22 @@ class TestRetrieverWithFakeEmbeddings(unittest.TestCase):
         result = self.retriever.retrieve_context("How much is the deposit?", top_k=3, score_threshold=0.5)
         self.assertEqual(result["contexts"], [])
 
+    def test_retrieve_all_returns_every_document_with_no_query(self):
+        result = self.retriever.retrieve_all()
+        self.assertIsNone(result["query"])
+        self.assertEqual(len(result["contexts"]), 3)
+        self.assertEqual(set(result["contexts"]), set(self._passage_vectors.keys()))
+        self.assertEqual(result["scores"], [1.0, 1.0, 1.0])
+
+    def test_retrieve_all_respects_limit(self):
+        result = self.retriever.retrieve_all(limit=2)
+        self.assertEqual(len(result["contexts"]), 2)
+
+    def test_retrieve_all_on_empty_index_returns_empty_result(self):
+        empty_retriever = Retriever(embedding_model="bge-small", vector_db="faiss")
+        result = empty_retriever.retrieve_all()
+        self.assertEqual(result, {"query": None, "contexts": [], "scores": []})
+
 
 @unittest.skipUnless(_FAISS_AVAILABLE, "faiss is not installed")
 class TestUnknownVectorDbBackend(unittest.TestCase):

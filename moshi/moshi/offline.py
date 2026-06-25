@@ -595,7 +595,7 @@ def main():
     # docs/STREAMING_AND_INJECTION_DESIGN.md for the design behind this mode.
     parser.add_argument(
         "--rag-enable", action="store_true",
-        help="Enable RAG knowledge injection (Mode C). Requires --rag-index and --rag-query."
+        help="Enable RAG knowledge injection (Mode C). Requires --rag-index."
     )
     parser.add_argument(
         "--rag-index", type=str,
@@ -604,7 +604,10 @@ def main():
     )
     parser.add_argument(
         "--rag-query", type=str, default="",
-        help="Query text used to retrieve knowledge for injection."
+        help="Query text used to retrieve knowledge for injection. Optional for "
+             "persona_rag/prompt_rag/cache_aware -- if omitted, the whole knowledge base (up to "
+             "--rag-top-k chunks) is injected instead of a similarity-search result. Required for "
+             "turn_injection/dynamic_runtime."
     )
     parser.add_argument("--rag-top-k", type=int, default=5)
     parser.add_argument("--rag-embedding-model", type=str, default="bge-small")
@@ -644,7 +647,17 @@ def main():
     args = parser.parse_args()
 
     if args.rag_enable and not args.rag_query:
-        raise ValueError("--rag-enable was passed without --rag-query; nothing to retrieve for.")
+        # PERSONA_RAG/PROMPT_RAG/CACHE_AWARE retrieve via RAGSession._retrieve_for_injection,
+        # which falls back to injecting the whole knowledge base when the query is empty (the
+        # same fallback that makes RAG work for a live browser connection, which has no query at
+        # all -- see docs/PRODUCTION_RAG.md). TURN_INJECTION/DYNAMIC_RUNTIME's "prepare" methods
+        # retrieve directly, without that fallback, so they still need an explicit query.
+        if args.rag_injection_mode in ("turn_injection", "dynamic_runtime"):
+            raise ValueError(
+                f"--rag-injection-mode={args.rag_injection_mode!r} requires --rag-query "
+                "(it retrieves directly, without the empty-query/whole-KB fallback that "
+                "persona_rag/prompt_rag/cache_aware have)."
+            )
 
     # If --voice-prompt-dir is omitted, voices.tgz is downloaded from HF and extracted.
     voice_prompt_dir = _get_voice_prompt_dir(

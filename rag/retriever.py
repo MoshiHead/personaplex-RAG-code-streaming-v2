@@ -94,3 +94,23 @@ class Retriever:
             "contexts": [r.text for r in results],
             "scores": [r.score for r in results],
         }
+
+    def retrieve_all(self, limit: Optional[int] = None) -> dict:
+        """Returns every document in the index, bypassing similarity search entirely -- for when
+        there is genuinely no query text to retrieve against (e.g. a live voice connection with no
+        ASR and no explicit query supplied by the client -- see
+        `rag.server_integration.RAGSession._retrieve_for_injection`). Same
+        `{"query", "contexts", "scores"}` shape as `retrieve_context`, with `query=None` and
+        `scores` all `1.0` (no real similarity was computed, so the score is not meaningful as a
+        ranking signal -- it's included only for shape-compatibility with logging/benchmark code
+        that expects a `scores` list).
+        """
+        if self._store is None or self._store.index.ntotal == 0:
+            return {"query": None, "contexts": [], "scores": []}
+
+        results = self._store.get_all(limit=limit)
+        return {
+            "query": None,
+            "contexts": [r.text for r in results],
+            "scores": [r.score for r in results],
+        }

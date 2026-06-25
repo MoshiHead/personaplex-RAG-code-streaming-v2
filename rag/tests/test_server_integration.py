@@ -39,13 +39,24 @@ class FakeTokenizer:
 class FakeRetriever:
     """Stands in for rag.retriever.Retriever without needing faiss/sentence-transformers."""
 
-    def __init__(self, canned_result: dict):
+    def __init__(self, canned_result: dict, all_result: dict | None = None):
         self._canned_result = canned_result
+        # Defaults to the same canned contexts/scores as retrieve_context (just query=None), since
+        # most tests don't care about the difference -- override via `all_result` when a test
+        # needs the empty-query (whole-KB) path to return something distinct.
+        self._all_result = all_result or {
+            "query": None, "contexts": canned_result["contexts"], "scores": [1.0] * len(canned_result["contexts"]),
+        }
         self.queries_seen = []
+        self.retrieve_all_calls = 0
 
     def retrieve_context(self, query, top_k=5, score_threshold=None, metadata_filter=None):
         self.queries_seen.append(query)
         return self._canned_result
+
+    def retrieve_all(self, limit=None):
+        self.retrieve_all_calls += 1
+        return self._all_result
 
 
 def _make_session(config: RAGConfig, log_dir: str, retriever=None) -> tuple:
@@ -115,6 +126,48 @@ class TestRAGSessionModeC(unittest.TestCase):
         self.assertIsNotNone(result["injection_latency_s"])
         # Real LMGen attrs aren't present on FakeLMGen -> kv_cache_status must degrade, not raise.
         self.assertFalse(result["kv_cache_status"]["available"])
+
+    def test_empty_query_falls_back_to_injecting_the_whole_kb_instead_of_skipping(self):
+        # This is the fix for the real bug: a live connection through the browser web UI has no
+        # way to supply rag_query at all (PersonaPlex has no ASR), so this is the normal case for
+        # any real conversation, not an edge case.
+        retriever = FakeRetriever(
+            {"query": "q", "contexts": ["fact A"], "scores": [0.9]},
+            all_result={"query": None, "contexts": ["fact A", "fact B", "fact C"], "scores": [1.0, 1.0, 1.0]},
+        )
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        result = session.inject_persona_compatible_knowledge("")
+
+        self.assertEqual(retriever.retrieve_all_calls, 1)
+        self.assertEqual(retriever.queries_seen, [])  # retrieve_context was never called
+        self.assertEqual(result["retrieved_contexts"], ["fact A", "fact B", "fact C"])
+        self.assertGreater(len(lm_gen.calls), 0)  # injection still actually happened
+        self.assertIsNone(result["user_query"])
+
+    def test_none_query_also_falls_back_to_the_whole_kb(self):
+        retriever = FakeRetriever(
+            {"query": "q", "contexts": ["fact A"], "scores": [0.9]},
+            all_result={"query": None, "contexts": ["fact A", "fact B"], "scores": [1.0, 1.0]},
+        )
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        result = session.inject_persona_compatible_knowledge(None)
+
+        self.assertEqual(retriever.retrieve_all_calls, 1)
+        self.assertGreater(len(lm_gen.calls), 0)
+
+    def test_empty_kb_with_no_query_skips_injection_with_a_clear_reason(self):
+        retriever = FakeRetriever(
+            {"query": "q", "contexts": ["fact A"], "scores": [0.9]},
+            all_result={"query": None, "contexts": [], "scores": []},
+        )
+        session, lm_gen = _make_session(self.config, self.tmp_dir, retriever=retriever)
+
+        result = session.inject_persona_compatible_knowledge("")
+
+        self.assertEqual(result["injection_strategy"], "skipped (no documents in the index)")
+        self.assertEqual(len(lm_gen.calls), 0)
 
     def test_inject_does_not_write_to_the_log_until_finalized(self):
         retriever = FakeRetriever({"query": "q", "contexts": ["fact one"], "scores": [0.8]})
