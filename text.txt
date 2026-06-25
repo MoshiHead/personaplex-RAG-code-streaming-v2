@@ -1,0 +1,44 @@
+Bangladesh Political Leadership
+Last Updated: June 2026
+
+Entity: President of Bangladesh
+Current Office Holder: Mohammed Shahabuddin
+Role: Head of State
+Country: Bangladesh
+
+Question: Who is the President of Bangladesh?
+Answer: Mohammed Shahabuddin is the President of Bangladesh.
+
+Question: Who serves as Head of State in Bangladesh?
+Answer: Mohammed Shahabuddin serves as the Head of State of Bangladesh.
+
+--------------------------------------------------
+
+Entity: Prime Minister of Bangladesh
+Current Office Holder: Tarique Rahman
+Role: Head of Government
+Country: Bangladesh
+
+Question: Who is the Prime Minister of Bangladesh?
+Answer: Tarique Rahman is the Prime Minister of Bangladesh.
+
+Question: Who serves as Head of Government in Bangladesh?
+Answer: Tarique Rahman serves as the Head of Government of Bangladesh.
+
+--------------------------------------------------
+
+Entity: Speaker of the Jatiya Sangsad
+Current Office Holder: Hafiz Uddin Ahmad
+Country: Bangladesh
+
+Question: Who is the Speaker of Parliament in Bangladesh?
+Answer: Hafiz Uddin Ahmad is the Speaker of the Jatiya Sangsad.
+
+--------------------------------------------------
+
+Entity: Leader of the Opposition
+Current Office Holder: Shafiqur Rahman
+Country: Bangladesh
+
+Question: Who is the Leader of the Opposition in Bangladesh?
+Answer: Shafiqur Rahman is the Leader of the Opposition in Bangladesh.
