@@ -37,6 +37,17 @@ class TestRAGConfigDefaults(unittest.TestCase):
         warnings = cfg.validate()
         self.assertTrue(any("VECTOR_DB" in w for w in warnings))
 
+    def test_full_kb_max_chunks_defaults_to_unlimited(self):
+        self.assertIsNone(RAGConfig().full_kb_max_chunks)
+
+    def test_invalid_full_kb_max_chunks_warns(self):
+        cfg = RAGConfig(full_kb_max_chunks=0)
+        warnings = cfg.validate()
+        self.assertTrue(any("full_kb_max_chunks" in w for w in warnings))
+
+    def test_full_kb_max_chunks_none_is_clean(self):
+        self.assertEqual(RAGConfig(full_kb_max_chunks=None).validate(), [])
+
     def test_invalid_dynamic_injection_top_k_warns(self):
         cfg = RAGConfig(dynamic_injection_top_k=0)
         warnings = cfg.validate()

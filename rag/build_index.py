@@ -69,28 +69,53 @@ def build_index(kb_path: str, out_path: str, embedding_model: str = "bge-small",
 
 
 def chunk_text(text: str, chunk_size_chars: int = 800, overlap_chars: int = 150) -> list[str]:
-    """Splits free-form text into retrieval-sized chunks. Paragraph-aware: first splits on blank
-    lines (so naturally-written prose keeps its own paragraph boundaries as chunk boundaries
-    wherever possible), then sub-splits any paragraph longer than `chunk_size_chars` using a
-    sliding window with `overlap_chars` of overlap, so a fact split exactly across a cut still has
-    a good chance of being fully visible in at least one chunk. Blank/whitespace-only paragraphs
-    are dropped. Returns an empty list for empty/whitespace-only input.
+    """Splits free-form text into retrieval-sized chunks. Paragraph-aware and merging: splits on
+    blank lines first, then **packs consecutive paragraphs together** into one chunk up to
+    `chunk_size_chars`, only starting a new chunk once the next paragraph would overflow the
+    budget. A single paragraph that alone exceeds `chunk_size_chars` is sub-split with a sliding
+    window (`overlap_chars` of overlap, so a fact split exactly across a cut still has a good
+    chance of being fully visible in at least one chunk). Blank/whitespace-only paragraphs are
+    dropped. Returns an empty list for empty/whitespace-only input.
+
+    Merging matters for documents that use blank lines liberally for visual structure (headers,
+    short "Field: value" blocks, "----" dividers, etc.) rather than as genuine topic boundaries --
+    a naive "one paragraph = one chunk" policy fragments one logical entry into many tiny chunks,
+    which silently loses content downstream wherever retrieval is capped at a fixed number of
+    chunks (e.g. `RAGSession`'s no-query fallback) if the entry's chunks don't all fit under that
+    cap in document order. See docs/PRODUCTION_RAG.md Section 9 for the real bug this caused.
     """
     paragraphs = [p.strip() for p in text.split("\n\n")]
     paragraphs = [p for p in paragraphs if p]
 
     chunks: list[str] = []
+    buffer = ""
     for paragraph in paragraphs:
-        if len(paragraph) <= chunk_size_chars:
-            chunks.append(paragraph)
+        if len(paragraph) > chunk_size_chars:
+            # Oversized paragraph: flush whatever's buffered first, then sub-split this one alone.
+            if buffer:
+                chunks.append(buffer)
+                buffer = ""
+            # `step` (not `chunk_size_chars - overlap_chars` inline) guards against a
+            # misconfigured `overlap_chars >= chunk_size_chars`, which would otherwise make
+            # `start` go non-increasing (or negative) and loop forever.
+            step = max(chunk_size_chars - overlap_chars, 1)
+            start = 0
+            while start < len(paragraph):
+                end = start + chunk_size_chars
+                chunks.append(paragraph[start:end].strip())
+                if end >= len(paragraph):
+                    break
+                start += step
             continue
-        start = 0
-        while start < len(paragraph):
-            end = start + chunk_size_chars
-            chunks.append(paragraph[start:end].strip())
-            if end >= len(paragraph):
-                break
-            start = end - overlap_chars
+
+        candidate = f"{buffer}\n\n{paragraph}" if buffer else paragraph
+        if len(candidate) <= chunk_size_chars:
+            buffer = candidate
+        else:
+            chunks.append(buffer)
+            buffer = paragraph
+    if buffer:
+        chunks.append(buffer)
     return chunks
 
 

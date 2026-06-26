@@ -102,7 +102,7 @@ class ServerState:
                  rag_log_dir: str = "rag_logs", rag_injection_mode: str = "persona_rag",
                  rag_vad_enable: bool = False, rag_turn_injection_top_k: int = 2,
                  rag_dynamic_injection_interval_s: float = 30.0, rag_dynamic_injection_top_k: int = 2,
-                 rag_default_query: str = ""):
+                 rag_default_query: str = "", rag_full_kb_max_chunks: int | None = None):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -169,6 +169,7 @@ class ServerState:
                 dynamic_injection_interval_s=rag_dynamic_injection_interval_s,
                 dynamic_injection_top_k=rag_dynamic_injection_top_k,
                 default_query=rag_default_query,
+                full_kb_max_chunks=rag_full_kb_max_chunks,
             )
             self.rag_session = RAGSession(
                 config=rag_config,
@@ -640,9 +641,16 @@ def main():
         "--rag-default-query", type=str, default="",
         help="Fallback retrieval query used when a connection supplies no rag_query of its own -- "
              "the normal case for the browser web UI, which has no way to send one. When this is "
-             "also empty (the default), RAGSession falls back further to injecting up to "
-             "--rag-top-k knowledge-base chunks regardless of relevance instead of skipping "
+             "also empty (the default), RAGSession falls back further to injecting the WHOLE "
+             "knowledge base (capped only by --rag-full-kb-max-chunks) instead of skipping "
              "injection entirely. See docs/PRODUCTION_RAG.md."
+    )
+    parser.add_argument(
+        "--rag-full-kb-max-chunks", type=int, default=None,
+        help="Caps how many chunks the no-query 'inject everything' fallback above will use. "
+             "Default (unset) is uncapped -- inject the entire knowledge base. Only set this for "
+             "knowledge bases large enough that injection latency (~25ms/token) becomes a "
+             "problem; see RAGConfig.full_kb_max_chunks."
     )
 
     args = parser.parse_args()
@@ -718,6 +726,7 @@ def main():
         rag_dynamic_injection_interval_s=args.rag_dynamic_injection_interval_s,
         rag_dynamic_injection_top_k=args.rag_dynamic_injection_top_k,
         rag_default_query=args.rag_default_query,
+        rag_full_kb_max_chunks=args.rag_full_kb_max_chunks,
     )
     logger.info("warming up the model")
     state.warmup()

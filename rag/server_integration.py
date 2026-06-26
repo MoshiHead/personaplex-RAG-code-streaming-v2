@@ -104,12 +104,16 @@ class RAGSession:
         simply never has a query string to retrieve against. Skipping injection entirely in that
         case would mean RAG never engages for any real conversation, only for callers that
         explicitly pass a query (`moshi.offline --rag-query`, or `rag.ws_demo_client`'s scripted
-        demo). Instead, falsy `query` falls back to `Retriever.retrieve_all(limit=config.top_k)`
-        -- injecting up to `top_k` knowledge-base chunks (in insertion order, not
-        relevance-ranked, since there is no query to rank against) so the model has *something*
-        from the knowledge base in context regardless of what gets asked. See
-        docs/PRODUCTION_RAG.md for the full reasoning and its limits (this is a best-effort
-        default, not equivalent to true per-question retrieval).
+        demo). Instead, falsy `query` falls back to
+        `Retriever.retrieve_all(limit=config.full_kb_max_chunks)` -- injecting the **whole**
+        knowledge base by default (`full_kb_max_chunks` defaults to `None`, meaning uncapped), in
+        insertion order, since there is no query to rank against. This is deliberately NOT capped
+        at `top_k` -- `top_k` bounds a *ranked* similarity-search result, where cutting the
+        lowest-ranked tail is reasonable; the no-query path has no ranking at all, so capping it
+        at the same small default silently and deterministically drops whichever chunks happen to
+        come later in the source document (a real bug this caused -- see
+        docs/PRODUCTION_RAG.md Section 9). See that doc for this fallback's remaining limits (it
+        is not equivalent to true per-question retrieval).
         """
         record = RequestLogRecord(mode=mode, user_query=query or None)
 
@@ -123,7 +127,7 @@ class RAGSession:
                 query, top_k=self.config.top_k, score_threshold=self.config.score_threshold
             )
         else:
-            retrieval = self.retriever.retrieve_all(limit=self.config.top_k)
+            retrieval = self.retriever.retrieve_all(limit=self.config.full_kb_max_chunks)
         record.retrieval_latency_s = time.monotonic() - t0
         record.retrieved_contexts = retrieval["contexts"]
         record.retrieved_scores = retrieval["scores"]
@@ -172,9 +176,9 @@ class RAGSession:
 
         `query` may be falsy -- this is the normal case for a real connection through the browser
         web UI, which has no way to supply one (see `_retrieve_for_injection`'s docstring). When
-        falsy, this injects up to `config.top_k` knowledge-base chunks regardless of relevance
-        (no query to rank against) instead of skipping injection entirely -- see
-        docs/PRODUCTION_RAG.md.
+        falsy, this injects the whole knowledge base (capped only by `config.full_kb_max_chunks`,
+        which defaults to uncapped) regardless of relevance (no query to rank against) instead of
+        skipping injection entirely -- see docs/PRODUCTION_RAG.md.
 
         Returns the record as a dict, **not yet written to the log**. The retrieval/injection
         phases are the only thing this method can time -- whatever happens next (the live

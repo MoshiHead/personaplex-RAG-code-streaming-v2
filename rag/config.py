@@ -79,12 +79,24 @@ class RAGConfig:
     # Fallback query used by a live moshi.server connection when the client supplies no
     # `rag_query` of its own -- the normal case for the browser web UI, which has no way to send
     # one (PersonaPlex has no ASR, and the UI predates this project's `rag_query` parameter). When
-    # empty (the default), RAGSession falls back further still to injecting up to `top_k`
-    # knowledge-base chunks regardless of relevance (Retriever.retrieve_all) rather than skipping
+    # empty (the default), RAGSession falls back further still to injecting the whole knowledge
+    # base (Retriever.retrieve_all, capped only by `full_kb_max_chunks` below) rather than skipping
     # injection entirely -- see docs/PRODUCTION_RAG.md. Setting this to a short description of the
     # deployment's domain (e.g. "drone rental policies") lets an operator get real similarity-search
     # retrieval by default instead of the cruder "inject everything" fallback.
     default_query: str = ""
+
+    # Cap on how many chunks the empty-query "inject everything" fallback above will use.
+    # Deliberately NOT the same knob as `top_k`: `top_k` bounds a *ranked* similarity-search
+    # result, where cutting off the lowest-ranked results is a reasonable tradeoff; the no-query
+    # fallback has no ranking at all (chunks come back in plain insertion/file order), so capping
+    # it at the same small default as `top_k` silently and deterministically drops whichever
+    # chunks happen to come later in the source document -- exactly the real bug this knob fixes
+    # (see docs/PRODUCTION_RAG.md Section 9). `None` (the default) means "inject the entire
+    # knowledge base, uncapped" -- correct unless the knowledge base is large enough that the
+    # injection latency (~25ms/token, per Mode C's benchmark) becomes a real problem, in which
+    # case set this explicitly.
+    full_kb_max_chunks: int | None = None
 
     # Where per-request logs (Phase 9) and benchmark reports (Phase 8) get written.
     log_dir: str = "rag_logs"
@@ -153,6 +165,11 @@ class RAGConfig:
                 "fixed-interval re-injection -- Mode C's benchmark measured ~25ms per injected "
                 "token. Consider keeping this small (1-2) so repeated injections don't stall the "
                 "live audio."
+            )
+
+        if self.full_kb_max_chunks is not None and self.full_kb_max_chunks <= 0:
+            warnings.append(
+                f"full_kb_max_chunks should be a positive integer or None, got {self.full_kb_max_chunks}."
             )
 
         return warnings

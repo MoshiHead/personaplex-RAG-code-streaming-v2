@@ -90,11 +90,13 @@ underlying (already-proven) injection mechanism.
 ## 6. Using your own knowledge base
 
 Replace the contents of `rag/data/text.txt` with your own plain text (any paragraph structure
-works -- `chunk_text` splits on blank lines first, and only falls back to a fixed-size sliding
-window for paragraphs longer than `chunk_size_chars`, default 800), then re-run Section 22's
-"Build the production FAISS index" cell. To use a different file path entirely, change
-`PRODUCTION_TEXT_KB_PATH` in that cell. No other code changes are required -- retrieval, injection,
-and the live server's RAG code path are all already knowledge-source-agnostic.
+works -- `chunk_text` splits on blank lines first, then **packs consecutive short paragraphs
+together** up to `chunk_size_chars` (default 800), only starting a new chunk once the next
+paragraph would overflow the budget, and only sub-splits a single paragraph that alone exceeds
+the budget), then re-run Section 22's "Build the production FAISS index" cell. To use a different
+file path entirely, change `PRODUCTION_TEXT_KB_PATH` in that cell. No other code changes are
+required -- retrieval, injection, and the live server's RAG code path are all already
+knowledge-source-agnostic.
 
 ## 7. Performance expectations
 
@@ -127,11 +129,12 @@ an explicit query.
 **Fix** (three changes, all in already-existing code paths, no new mechanism):
 
 1. `RAGSession._retrieve_for_injection` (`rag/server_integration.py`) now accepts a falsy `query`
-   and falls back to `Retriever.retrieve_all(limit=config.top_k)` -- injecting up to `top_k`
-   knowledge-base chunks regardless of relevance -- instead of skipping injection. New
-   `FaissVectorStore.get_all()`/`Retriever.retrieve_all()` (`rag/vector_store.py`,
-   `rag/retriever.py`) support this by reading back stored chunks directly, bypassing similarity
-   search entirely (there is nothing to rank against without a query).
+   and falls back to `Retriever.retrieve_all()` -- injecting knowledge-base chunks regardless of
+   relevance -- instead of skipping injection. New `FaissVectorStore.get_all()`/
+   `Retriever.retrieve_all()` (`rag/vector_store.py`, `rag/retriever.py`) support this by reading
+   back stored chunks directly, bypassing similarity search entirely (there is nothing to rank
+   against without a query). (This originally capped at `top_k`; Section 9 found and fixed a real
+   bug in that cap.)
 2. `moshi/moshi/server.py`'s `handle_chat` no longer requires `rag_query` to be truthy before
    attempting injection. A new `RAGConfig.default_query` / `--rag-default-query` lets an operator
    configure a real similarity-search fallback (e.g. a one-line description of the deployment's
@@ -146,12 +149,70 @@ query") that connects with `rag_query=""` -- exactly what the browser sends -- a
 injection still happened, instead of only ever testing the easy case.
 
 **The remaining, genuine limitation**: this fix makes the model *always have* the knowledge base
-in context, which is sufficient grounding for a knowledge base small enough to fit entirely within
-`top_k` chunks (true for the 10-paragraph `text.txt` sample regardless of phrasing). It is **not**
+in context, which is sufficient grounding for a knowledge base small enough to fit. It is **not**
 true per-question retrieval -- there is still no live signal of what the user actually asked to
-rank chunks against. For a knowledge base too large for `top_k` to cover, the practical levers are
-a well-chosen `--rag-default-query` (static, but at least relevance-ranked) or, beyond the scope of
+rank chunks against. For a knowledge base too large to inject in full, the practical levers are a
+well-chosen `--rag-default-query` (static, but at least relevance-ranked) or, beyond the scope of
 this project as currently constrained, adding ASR -- and even then, Sections 8/10's real-pod
 findings suggest a turn-boundary-triggered mid-call injection would likely still arrive too late to
 influence the response. There is currently no way around this without changing the "no ASR, no
 mid-stream injection" constraints this project was built under.
+
+## 9. Second real-pod bug: chunking fragmentation + a stale `top_k` cap silently dropped later entries
+
+After Section 8's fix, a multi-entry knowledge base (Bangladesh political leadership: President,
+Prime Minister, Speaker, Leader of the Opposition, four separate "Entity: .../Question: .../
+Answer: ..." sections in `text.txt`) only ever grounded the **first** entry in the file, no matter
+which entry was asked about. Reordering the file changed *which* entry worked, always the first
+one -- a clean, deterministic, position-dependent symptom, not the vaguer "model sometimes
+hallucinates" pattern Section 8's bug produced.
+
+**Root cause, confirmed by direct reproduction against the real file**: two compounding bugs in
+this project's own code, not a model limitation.
+
+1. **Chunking was too fine-grained.** `chunk_text`'s original policy was "one paragraph (one
+   blank-line-separated block) = one chunk." The Bangladesh file uses blank lines liberally for
+   visual structure -- a title, four "Entity: ..." blocks, eight "Question:/Answer:" blocks, and
+   three "----" dividers -- 14 blocks total for 4 conceptual entries. Run through the old
+   `chunk_text`, the President's content alone (title + its Entity block + its two Q/A blocks +
+   the first divider) occupied chunks 0-4.
+2. **The no-query fallback was capped at `top_k` (default 5).** `RAGSession._retrieve_for_injection`
+   called `Retriever.retrieve_all(limit=self.config.top_k)`, and `retrieve_all` returns chunks in
+   plain file order. With 14 chunks and a cap of 5, only chunks 0-4 -- all about the title and the
+   President -- were ever injected. The Prime Minister/Speaker/Opposition chunks (5-13) were never
+   injected, period, regardless of which question was asked. Reordering the file just moved which
+   entry landed in the surviving first 5 -- exactly the observed symptom.
+
+Verified directly: running the real `rag/data/text.txt` through the old `chunk_text` produced
+exactly 14 chunks, with chunks 0-4 covering only the title and President -- reproducing the bug
+from the actual file content, not a synthetic approximation.
+
+**Fix (two parts, addressing each root cause -- not a workaround for either):**
+
+1. **`chunk_text` now merges consecutive short paragraphs** (`rag/build_index.py`) instead of
+   giving every blank-line-separated block its own chunk: paragraphs are packed together up to
+   `chunk_size_chars`, only starting a new chunk once the next paragraph would overflow the
+   budget, and only sub-splitting a single paragraph that alone exceeds the budget. Run against
+   the real `text.txt`, this collapses the same 14 blocks into 2 chunks. (A latent, unrelated bug
+   in the sub-split loop -- `overlap_chars >= chunk_size_chars` made the scan position go
+   non-increasing and loop until `MemoryError` -- was found and fixed in the same pass, via a
+   `step = max(chunk_size_chars - overlap_chars, 1)` guard.)
+2. **The no-query fallback is no longer capped by `top_k`.** New `RAGConfig.full_kb_max_chunks`
+   (`int | None`, default `None`) is what `_retrieve_for_injection` passes to `retrieve_all()`
+   now. `top_k` bounds a *ranked* similarity-search result, where cutting the lowest-ranked tail is
+   reasonable; the no-query path has no ranking at all (chunks come back in plain file order), so
+   reusing `top_k` as its cap was the wrong default -- it silently and deterministically drops
+   whichever chunks happen to come later in the source document. The new default (`None`,
+   uncapped) injects the entire knowledge base; set `--rag-full-kb-max-chunks` /
+   `--rag-default-query` explicitly only once a knowledge base is large enough that injection
+   latency (~25ms/token) becomes the actual constraint.
+
+Either fix alone would have resolved this specific file (2 merged chunks comfortably fit under the
+old `top_k=5` cap; an uncapped fallback would have injected all 14 fragments even unmerged) -- both
+are implemented because each addresses a real, independent correctness gap: fragmentation produces
+more chunks than necessary regardless of any cap, and capping the no-query path by a
+similarity-search knob is conceptually wrong regardless of how well-chunked the source document is.
+
+12 new/updated unit tests cover both fixes directly, including a reproduction of the
+many-blank-line-block fragmentation pattern and the `overlap_chars >= chunk_size_chars` regression.
+122 tests pass total.

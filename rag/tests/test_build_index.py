@@ -30,15 +30,58 @@ class TestChunkText(unittest.TestCase):
         text = "This is a short paragraph that fits well under the chunk size."
         self.assertEqual(chunk_text(text, chunk_size_chars=800), [text])
 
-    def test_splits_on_paragraph_boundaries_first(self):
+    def test_merges_consecutive_short_paragraphs_into_one_chunk(self):
+        # The actual fix (docs/PRODUCTION_RAG.md Section 9): short paragraphs that fit together
+        # under chunk_size_chars are packed into ONE chunk, not split one-per-paragraph. A
+        # document written with liberal blank lines for visual structure (headers, short
+        # "Field: value" blocks, etc.) no longer fragments into many tiny chunks that could get
+        # silently truncated downstream by a fixed chunk-count cap.
         text = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph."
         chunks = chunk_text(text, chunk_size_chars=800)
+        self.assertEqual(chunks, ["First paragraph.\n\nSecond paragraph.\n\nThird paragraph."])
+
+    def test_keeps_paragraph_boundaries_as_chunk_boundaries_once_the_budget_is_exceeded(self):
+        # Same input as above, but with a budget too small for all three to fit together --
+        # paragraph boundaries are still respected as the only place a (non-oversized) chunk can
+        # split.
+        text = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph."
+        chunks = chunk_text(text, chunk_size_chars=20)
         self.assertEqual(chunks, ["First paragraph.", "Second paragraph.", "Third paragraph."])
 
     def test_blank_paragraphs_are_dropped(self):
         text = "First.\n\n\n\nSecond.\n\n   \n\nThird."
-        chunks = chunk_text(text, chunk_size_chars=800)
+        # chunk_size_chars=10 is bigger than any single paragraph here (max 7 chars) but smaller
+        # than any two combined (>= 6+2+6=14), so each stays its own chunk without being treated
+        # as "oversized" (which would trigger sub-splitting instead of plain separation).
+        chunks = chunk_text(text, chunk_size_chars=10)
         self.assertEqual(chunks, ["First.", "Second.", "Third."])
+
+    def test_many_short_blank_line_separated_blocks_merge_instead_of_fragmenting(self):
+        # Regression test for the real bug: a document that uses blank lines liberally for visual
+        # structure (a title, several short "Entity: ..."/"Field: value" blocks, and "----"
+        # divider lines) used to fragment into one chunk per block, for what is conceptually 2
+        # entries -- which then silently lost the second entry entirely once downstream retrieval
+        # capped the number of usable chunks (see docs/PRODUCTION_RAG.md Section 9 for the
+        # real-world version of this with 14 blocks / 4 entries). With merging, this collapses to
+        # far fewer chunks and both entries' facts end up close enough together to survive any
+        # reasonable cap.
+        text = (
+            "Country Facts\n\n"
+            "Entity: Alpha\nHolder: Person One\n\n"
+            "Question: Who holds Alpha?\nAnswer: Person One holds Alpha.\n\n"
+            "----------\n\n"
+            "Entity: Beta\nHolder: Person Two\n\n"
+            "Question: Who holds Beta?\nAnswer: Person Two holds Beta.\n\n"
+            "----------"
+        )
+        naive_paragraph_count = len([p for p in text.split("\n\n") if p.strip()])
+        self.assertEqual(naive_paragraph_count, 7)  # what the old one-paragraph-one-chunk logic produced
+
+        chunks = chunk_text(text, chunk_size_chars=800)
+        self.assertLess(len(chunks), naive_paragraph_count)
+        combined = "\n".join(chunks)
+        self.assertIn("Person One", combined)
+        self.assertIn("Person Two", combined)  # the entry that used to get truncated away
 
     def test_long_paragraph_is_sub_split_with_overlap(self):
         paragraph = "x" * 1000
@@ -49,6 +92,15 @@ class TestChunkText(unittest.TestCase):
         # Reconstructing without overlap should recover at least the full original length's
         # worth of characters (overlap means some 'x's are double-counted, never lost).
         self.assertGreaterEqual(sum(len(c) for c in chunks), len(paragraph))
+
+    def test_overlap_chars_larger_than_chunk_size_chars_does_not_hang_or_crash(self):
+        # Regression test: a misconfigured overlap_chars >= chunk_size_chars used to make `start`
+        # in the sub-split loop go negative and never reach len(paragraph), looping until
+        # MemoryError. The fix clamps the per-iteration step to at least 1 char of progress.
+        paragraph = "y" * 50
+        chunks = chunk_text(paragraph, chunk_size_chars=5, overlap_chars=150)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(c) <= 5 for c in chunks))
 
     def test_sub_split_chunks_cover_the_whole_paragraph(self):
         # Non-repeating content (sequential 3-digit numbers) so each chunk's text is unique and
@@ -79,8 +131,11 @@ class TestLoadDocumentsFromTextFile(unittest.TestCase):
         return path
 
     def test_produces_one_document_per_chunk_with_stable_ids(self):
+        # chunk_size_chars=15 is bigger than any single paragraph here (max 11 chars) but smaller
+        # than any two combined, so each stays its own chunk -- isolating doc_id assignment from
+        # the merge behavior tested separately in TestChunkText.
         path = self._write("text.txt", "Para one.\n\nPara two.\n\nPara three.")
-        documents = load_documents_from_text_file(path, chunk_size_chars=800)
+        documents = load_documents_from_text_file(path, chunk_size_chars=15)
         self.assertEqual([d.text for d in documents], ["Para one.", "Para two.", "Para three."])
         self.assertEqual(
             [d.doc_id for d in documents],
@@ -150,7 +205,11 @@ class TestBuildIndexFromTextFile(unittest.TestCase):
         embeddings_module.EmbeddingModel.encode_passages = fake_encode_passages
         embeddings_module.EmbeddingModel.encode_query = fake_encode_query
         try:
-            report = build_index_from_text_file(text_path, out_path, chunk_size_chars=800)
+            # chunk_size_chars=80 keeps these three (each individually under 80 chars, but no two
+            # combined fit under 80) as three separate chunks -- this test is about retrieval
+            # distinguishing between facts via real FAISS, not about merge behavior (tested
+            # separately in TestChunkText).
+            report = build_index_from_text_file(text_path, out_path, chunk_size_chars=80)
             self.assertEqual(report["documents_indexed"], 3)
 
             retriever = Retriever()

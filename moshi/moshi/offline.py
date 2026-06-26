@@ -181,6 +181,7 @@ def run_inference(
     rag_turn_injection_top_k: int = 2,
     rag_dynamic_injection_interval_s: float = 30.0,
     rag_dynamic_injection_top_k: int = 2,
+    rag_full_kb_max_chunks: Optional[int] = None,
 ):
     """Run offline inference using an input WAV as the user-side stream.
 
@@ -331,6 +332,7 @@ def run_inference(
             turn_injection_top_k=rag_turn_injection_top_k,
             dynamic_injection_interval_s=rag_dynamic_injection_interval_s,
             dynamic_injection_top_k=rag_dynamic_injection_top_k,
+            full_kb_max_chunks=rag_full_kb_max_chunks,
         )
         rag_session = RAGSession(
             config=rag_config,
@@ -605,11 +607,17 @@ def main():
     parser.add_argument(
         "--rag-query", type=str, default="",
         help="Query text used to retrieve knowledge for injection. Optional for "
-             "persona_rag/prompt_rag/cache_aware -- if omitted, the whole knowledge base (up to "
-             "--rag-top-k chunks) is injected instead of a similarity-search result. Required for "
-             "turn_injection/dynamic_runtime."
+             "persona_rag/prompt_rag/cache_aware -- if omitted, the WHOLE knowledge base (capped "
+             "only by --rag-full-kb-max-chunks) is injected instead of a similarity-search "
+             "result. Required for turn_injection/dynamic_runtime."
     )
     parser.add_argument("--rag-top-k", type=int, default=5)
+    parser.add_argument(
+        "--rag-full-kb-max-chunks", type=int, default=None,
+        help="Caps how many chunks the empty-query 'inject everything' fallback above will use. "
+             "Default (unset) is uncapped -- inject the entire knowledge base. See "
+             "RAGConfig.full_kb_max_chunks."
+    )
     parser.add_argument("--rag-embedding-model", type=str, default="bge-small")
     parser.add_argument("--rag-log-dir", type=str, default="rag_logs")
     parser.add_argument(
@@ -710,6 +718,7 @@ def main():
             rag_turn_injection_top_k=args.rag_turn_injection_top_k,
             rag_dynamic_injection_interval_s=args.rag_dynamic_injection_interval_s,
             rag_dynamic_injection_top_k=args.rag_dynamic_injection_top_k,
+            rag_full_kb_max_chunks=args.rag_full_kb_max_chunks,
         )
 
 

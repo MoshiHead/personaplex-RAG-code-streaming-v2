@@ -49,12 +49,14 @@ class FakeRetriever:
         }
         self.queries_seen = []
         self.retrieve_all_calls = 0
+        self.retrieve_all_limits_seen = []
 
     def retrieve_context(self, query, top_k=5, score_threshold=None, metadata_filter=None):
         self.queries_seen.append(query)
         return self._canned_result
 
     def retrieve_all(self, limit=None):
+        self.retrieve_all_limits_seen.append(limit)
         self.retrieve_all_calls += 1
         return self._all_result
 
@@ -144,6 +146,39 @@ class TestRAGSessionModeC(unittest.TestCase):
         self.assertEqual(result["retrieved_contexts"], ["fact A", "fact B", "fact C"])
         self.assertGreater(len(lm_gen.calls), 0)  # injection still actually happened
         self.assertIsNone(result["user_query"])
+
+    def test_empty_query_fallback_is_not_capped_by_top_k(self):
+        # Regression test for the real bug (docs/PRODUCTION_RAG.md Section 9): retrieve_all used
+        # to be called with limit=config.top_k, which silently dropped any document beyond the
+        # first top_k chunks in file order -- exactly the "only the first entry works" symptom.
+        # config.top_k is deliberately small here (2) to prove it is NOT what bounds the no-query
+        # fallback; full_kb_max_chunks (default None/uncapped) is what should be passed instead.
+        config = RAGConfig(enable_rag=True, injection_mode=InjectionMode.PERSONA_RAG, top_k=2, log_dir=self.tmp_dir)
+        retriever = FakeRetriever(
+            {"query": "q", "contexts": ["fact A"], "scores": [0.9]},
+            all_result={"query": None, "contexts": ["A", "B", "C", "D"], "scores": [1.0] * 4},
+        )
+        session, _ = _make_session(config, self.tmp_dir, retriever=retriever)
+
+        result = session.inject_persona_compatible_knowledge("")
+
+        self.assertEqual(retriever.retrieve_all_limits_seen, [None])  # not [2] -- not capped by top_k
+        self.assertEqual(result["retrieved_contexts"], ["A", "B", "C", "D"])  # all 4, not just 2
+
+    def test_full_kb_max_chunks_caps_the_empty_query_fallback_when_explicitly_set(self):
+        config = RAGConfig(
+            enable_rag=True, injection_mode=InjectionMode.PERSONA_RAG,
+            top_k=2, full_kb_max_chunks=3, log_dir=self.tmp_dir,
+        )
+        retriever = FakeRetriever(
+            {"query": "q", "contexts": ["fact A"], "scores": [0.9]},
+            all_result={"query": None, "contexts": ["A", "B", "C"], "scores": [1.0] * 3},
+        )
+        session, _ = _make_session(config, self.tmp_dir, retriever=retriever)
+
+        session.inject_persona_compatible_knowledge("")
+
+        self.assertEqual(retriever.retrieve_all_limits_seen, [3])  # the explicit cap, not top_k=2
 
     def test_none_query_also_falls_back_to_the_whole_kb(self):
         retriever = FakeRetriever(
